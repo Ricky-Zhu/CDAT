@@ -1,115 +1,66 @@
-from stable_baselines import SAC, TD3, TRPO, PPO2
-import gym
-from modified_envs import *
-import yaml
-from stable_baselines.common.policies import MlpPolicy as mlp_standard
-from stable_baselines.sac.policies import FeedForwardPolicy as ffp_sac
-from stable_baselines.td3.policies import FeedForwardPolicy as ffp_td3
-from stable_baselines.ddpg.noise import NormalActionNoise
-from stable_baselines.common.vec_env import SubprocVecEnv, DummyVecEnv, VecNormalize
+import argparse
+import datetime
+import os
+import pprint
+
 import numpy as np
+import torch
+from mujoco_env import make_mujoco_env
+from torch.utils.tensorboard import SummaryWriter
 
+from tianshou.data import Collector, ReplayBuffer, VectorReplayBuffer
+from tianshou.exploration import GaussianNoise
+from tianshou.policy import TD3Policy
+from tianshou.trainer import offpolicy_trainer
+from tianshou.utils import TensorboardLogger, WandbLogger
+from tianshou.utils.net.common import Net
+from tianshou.utils.net.continuous import Actor, Critic
+from mujoco_env import *
 
-def training_policy(args):
-    training_algo = args.algo
-    training_steps = args.training_steps
-    env = args.env
-    args_env = args.args_env
-
-    model_name = training_algo + '_' + env + '_' + str(training_steps) + '.pkl'
-
-    with open('target_policy_params.yaml') as file:
-        args = yaml.load(file, Loader=yaml.FullLoader)
-    args = args[training_algo][args_env]
-
-    if training_algo == "SAC":
-
-        class CustomPolicy(ffp_sac):
-            def __init__(self, *args, **kwargs):
-                super(CustomPolicy, self).__init__(*args, **kwargs,
-                                                   feature_extraction="mlp", layers=[256, 256])
-
-        model = SAC(CustomPolicy, env,
-                    verbose=1,
-                    tensorboard_log='TBlogs/initial_policy_training',
-                    batch_size=args['batch_size'],
-                    buffer_size=args['buffer_size'],
-                    ent_coef=args['ent_coef'],
-                    learning_starts=args['learning_starts'],
-                    learning_rate=args['learning_rate'],
-                    train_freq=args['train_freq'],
-                    )
-    elif training_algo == "TD3":
-
-        n_actions = env.action_space.shape[-1]
-        action_noise = NormalActionNoise(mean=np.zeros(n_actions),
-                                         sigma=float(args['noise_std']) * np.ones(n_actions))
-
-        class CustomPolicy2(ffp_td3):
-            def __init__(self, *args, **kwargs):
-                super(CustomPolicy2, self).__init__(*args, **kwargs,
-                                                    feature_extraction="mlp", layers=[400, 300])
-
-        model = TD3(CustomPolicy2, env,
-                    verbose=1,
-                    tensorboard_log='TBlogs/initial_policy_training',
-                    batch_size=args['batch_size'],
-                    buffer_size=args['buffer_size'],
-                    gamma=args['gamma'],
-                    gradient_steps=args['gradient_steps'],
-                    learning_rate=args['learning_rate'],
-                    learning_starts=args['learning_starts'],
-                    action_noise=action_noise,
-                    train_freq=args['train_freq'],
-                    )
-
-    elif training_algo == "TRPO":
-
-        model = TRPO(mlp_standard, env,
-                     verbose=1,
-                     tensorboard_log='TBlogs/initial_policy_training',
-                     timesteps_per_batch=args['timesteps_per_batch'],
-                     lam=args['lam'],
-                     max_kl=args['max_kl'],
-                     gamma=args['gamma'],
-                     vf_iters=args['vf_iters'],
-                     vf_stepsize=args['vf_stepsize'],
-                     entcoeff=args['entcoeff'],
-                     cg_damping=args['cg_damping'],
-                     cg_iters=args['cg_iters']
-                     )
-    elif training_algo == "PPO2":
-        model = PPO2(mlp_standard,
-                     env,
-                     n_steps=int(args['n_steps'] / env.num_envs),
-                     nminibatches=args['nminibatches'],
-                     lam=args['lam'],
-                     gamma=args['gamma'],
-                     ent_coef=args['ent_coef'],
-                     noptepochs=args['noptepochs'],
-                     learning_rate=args['learning_rate'],
-                     cliprange=args['cliprange'],
-                     verbose=1,
-                     tensorboard_log='data/TBlogs/initial_policy_training',
-                     )
-
-    else:
-        raise NotImplementedError
-
-    model.learn(total_timesteps=training_steps,
-                tb_log_name=model_name.split('/')[-1],
-                log_interval=10, )
-    model.save(model_name)
-
-
-if __name__ == "__main__":
-    import argparse
-
+def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env', default='HalfCheetah-v2', type=str)
-    parser.add_argument('--algo', default='SAC', type=str)
-    parser.add_argument('--training_steps', default=1e6, type=int)
-    parser.add_argument('--args_env', default='HalfCheetah-v2', type=str)
+    parser.add_argument("--task", type=str, default="HalfCheetah-v2")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--buffer-size", type=int, default=1000000)
+    parser.add_argument("--hidden-sizes", type=int, nargs="*", default=[256, 256])
+    parser.add_argument("--actor-lr", type=float, default=3e-4)
+    parser.add_argument("--critic-lr", type=float, default=3e-4)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--tau", type=float, default=0.005)
+    parser.add_argument("--exploration-noise", type=float, default=0.1)
+    parser.add_argument("--policy-noise", type=float, default=0.2)
+    parser.add_argument("--noise-clip", type=float, default=0.5)
+    parser.add_argument("--update-actor-freq", type=int, default=2)
+    parser.add_argument("--start-timesteps", type=int, default=25000)
+    parser.add_argument("--epoch", type=int, default=200)
+    parser.add_argument("--step-per-epoch", type=int, default=5000)
+    parser.add_argument("--step-per-collect", type=int, default=1)
+    parser.add_argument("--update-per-step", type=int, default=1)
+    parser.add_argument("--n-step", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--training-num", type=int, default=1)
+    parser.add_argument("--test-num", type=int, default=10)
+    parser.add_argument("--logdir", type=str, default="log")
+    parser.add_argument("--render", type=float, default=0.)
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
+    parser.add_argument("--resume-path", type=str, default=None)
+    parser.add_argument("--resume-id", type=str, default=None)
+    parser.add_argument(
+        "--logger",
+        type=str,
+        default="tensorboard",
+        choices=["tensorboard", "wandb"],
+    )
+    parser.add_argument("--wandb-project", type=str, default="mujoco.benchmark")
+    parser.add_argument(
+        "--watch",
+        default=False,
+        action="store_true",
+        help="watch the play of pre-trained policy only",
+    )
+    return parser.parse_args()
 
-    args = parser.parse_args()
-    training_policy(args)
+def td3_training(args):
+    pass
