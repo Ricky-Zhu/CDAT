@@ -2,5 +2,5 @@
 
 ```shell
 cd base_training
-python td3_trainer.py --task [env_name]  
+python td3_trainer.py --task HalfCheetah_3leg-v2 
 ```
